@@ -1,0 +1,68 @@
+name: collect-ccu
+on:
+  schedule:
+    # daily tier — 采样时刻逐日轮转 (6 个基准小时)。固定时刻会让月均值变成
+    # "每天那个时段读数的均值", 不是"全天各时段的均值" —— 不同的统计量。
+    # GH cron 的抖动在这里**有益**: 等于给轮转再叠一层随机化。
+    # :07 偏移躲开整点拥堵 (同 prices repo)。
+    - cron: '7 0 1,7,13,19,25,31 * *'
+    - cron: '7 4 2,8,14,20,26 * *'
+    - cron: '7 8 3,9,15,21,27 * *'
+    - cron: '7 12 4,10,16,22,28 * *'
+    - cron: '7 16 5,11,17,23,29 * *'
+    - cron: '7 20 6,12,18,24,30 * *'
+    # sparse tier — 周四 02:07 UTC (与 daily 的任一基准小时都不撞)
+    - cron: '7 2 * * 4'
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: 'tier to collect'
+        required: true
+        default: 'daily'
+        type: choice
+        options: [daily, sparse, top]
+
+permissions:
+  contents: write
+
+# 同一 tier 不重入; 不取消进行中的 (半趟数据也要提交)
+concurrency:
+  group: collect-ccu
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    # daily 实测 ~3.7h; 留到 5.5h 给 429 退避与 runner 抖动 (GH 硬上限 6h)
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      # ⚠ 用 github.event.schedule (触发本次运行的那条 cron 原文) 判 tier, **不要用
+      # date 判钟点** —— GH 的 schedule 会延迟, 一延迟 date 就落到别的小时, sparse
+      # 那趟会被误判成 daily。schedule 字符串不受延迟影响。
+      - name: Pick tier
+        id: pick
+        env:
+          SCHED: ${{ github.event.schedule }}
+          INPUT: ${{ inputs.tier }}
+        run: |
+          if   [ -n "$INPUT" ];          then T="$INPUT"
+          elif [ "$SCHED" = '7 2 * * 4' ]; then T=sparse
+          else                                T=daily; fi
+          echo "tier=$T" >> $GITHUB_OUTPUT
+          echo "tier=$T  (schedule='$SCHED' input='$INPUT')"
+
+      - name: Collect
+        run: python3 collect.py ${{ steps.pick.outputs.tier }}
+
+      # always(): 超时/失败也提交已落盘的部分 —— 丢一趟的尾巴好过丢整趟
+      - name: Commit data
+        if: always()
+        run: |
+          git config user.name 'steamcozy-bot'
+          git config user.email 'suggest@steamcozy.com'
+          git add data
+          git commit -m "ccu ${{ steps.pick.outputs.tier }} $(date -u +'%Y-%m-%d %H:%M') UTC" \
+            || { echo 'nothing to commit'; exit 0; }
+          git pull --rebase -q && git push
