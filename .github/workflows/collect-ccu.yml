@@ -33,8 +33,14 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    # daily 实测 ~3.7h; 留到 5.5h 给 429 退避与 runner 抖动 (GH 硬上限 6h)
+    # 分片后 daily 每片 ~2.5h sleep + 请求延迟; 5.5h 是余量翻倍后的上限 (GH 硬上限 6h)。
+    # ⚠ 历史: tier 长到 13.9k 款时单 job 5h30 连续三轮被砍 (2026-08-27..29), 尾部同一批
+    #   ~900 款每天缺失。matrix 2 分片是结构修法; tier 再长到 ~26k 时把 SHARDS 提到 3。
     timeout-minutes: 330
+    strategy:
+      fail-fast: false          # 一片挂掉不连坐另一片
+      matrix:
+        shard: [0, 1]
     steps:
       - uses: actions/checkout@v4
 
@@ -53,16 +59,29 @@ jobs:
           echo "tier=$T" >> $GITHUB_OUTPUT
           echo "tier=$T  (schedule='$SCHED' input='$INPUT')"
 
+      # daily 走分片; sparse/top 单趟足够 (1.2h/瞬时), 只让 shard 0 跑, shard 1 空过
       - name: Collect
-        run: python3 collect.py ${{ steps.pick.outputs.tier }}
+        if: steps.pick.outputs.tier == 'daily' || matrix.shard == 0
+        run: |
+          if [ "${{ steps.pick.outputs.tier }}" = daily ]; then
+            python3 collect.py daily --shard ${{ matrix.shard }}/2
+          else
+            python3 collect.py ${{ steps.pick.outputs.tier }}
+          fi
 
-      # always(): 超时/失败也提交已落盘的部分 —— 丢一趟的尾巴好过丢整趟
+      # always(): 超时/失败也提交已落盘的部分 —— 丢一趟的尾巴好过丢整趟。
+      # 两片并发收尾会抢 push (各写自己的 _sN 文件, rebase 永无内容冲突,
+      # 只是 non-fast-forward 竞争) → 重试到赢为止。
       - name: Commit data
-        if: always()
+        if: always() && (steps.pick.outputs.tier == 'daily' || matrix.shard == 0)
         run: |
           git config user.name 'steamcozy-bot'
           git config user.email 'suggest@steamcozy.com'
           git add data
-          git commit -m "ccu ${{ steps.pick.outputs.tier }} $(date -u +'%Y-%m-%d %H:%M') UTC" \
+          git commit -m "ccu ${{ steps.pick.outputs.tier }} s${{ matrix.shard }} $(date -u +'%Y-%m-%d %H:%M') UTC" \
             || { echo 'nothing to commit'; exit 0; }
-          git pull --rebase -q && git push
+          for i in 1 2 3 4 5; do
+            git pull --rebase -q && git push && exit 0
+            echo "push race (attempt $i), retrying"; sleep $((5 + RANDOM % 20))
+          done
+          echo 'push failed after 5 attempts'; exit 1

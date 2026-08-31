@@ -5,7 +5,7 @@ Runs on GitHub Actions (stdlib only, no pip installs). Data source is Steam's
 public, keyless APIs. Output: data/<tier>/<YYYY-MM>/<YYYY-MM-DD_HHMM>.csv with
 header  ts,appid,concurrent,peak_in_game,src
 
-    collect.py daily     # ~10k games, ~3.7h  (rotating start hour, 6 crons)
+    collect.py daily --shard 0/2   # half the daily tier (matrix-sharded in CI)
     collect.py sparse    # ~6k  games, ~2.2h  (weekly)
     collect.py top       # top-100 batch, 1 request (manual / smoke test)
 
@@ -68,11 +68,12 @@ def get(url, tries=4):
     return None
 
 
-def out_path(tier: str) -> Path:
+def out_path(tier: str, shard=None) -> Path:
     now = datetime.now(timezone.utc)
     p = ROOT / "data" / tier / f"{now:%Y-%m}"
     p.mkdir(parents=True, exist_ok=True)
-    return p / f"{now:%Y-%m-%d_%H%M}.csv"
+    tag = f"_s{shard[0]}" if shard else ""
+    return p / f"{now:%Y-%m-%d_%H%M}{tag}.csv"
 
 
 def run_top(w) -> int:
@@ -103,8 +104,26 @@ def run_single(w, appids, fh) -> int:
 
 
 def main() -> None:
-    tier = sys.argv[1] if len(sys.argv) > 1 else "top"
-    dst = out_path(tier)
+    # --shard k/n: run 1/n of the tier list (stride slice appids[k::n]).
+    # Why: the daily tier grew past what one 6h GH job can hold (13.9k x 1.3s
+    # = 5.0h of sleep alone; 3 runs were killed at timeout 2026-08-27..29,
+    # always cutting the SAME ~900 tail games). Sharding across a matrix
+    # halves wall clock; stride keeps each shard spread over the whole list
+    # so a killed shard tail is not one contiguous popularity band.
+    # Filenames get _s<k> so parallel shards never collide (importers glob).
+    args = sys.argv[1:]
+    shard = None
+    if "--shard" in args:
+        i = args.index("--shard")
+        k, n = map(int, args[i + 1].split("/"))
+        if not 0 <= k < n:
+            sys.exit(f"bad --shard {args[i + 1]!r} (want k/n with 0<=k<n)")
+        shard = (k, n)
+        del args[i:i + 2]
+    tier = args[0] if args else "top"
+    if shard and tier == "top":
+        sys.exit("--shard makes no sense for the single-request top tier")
+    dst = out_path(tier, shard)
     with dst.open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["ts", "appid", "concurrent", "peak_in_game", "src"])
@@ -115,8 +134,14 @@ def main() -> None:
             if not tf.exists():
                 sys.exit(f"missing {tf} — laptop must export/push tier lists first")
             appids = json.loads(tf.read_text())
-            print(f"{tier}: {len(appids):,} games, ~{len(appids) * SLEEP / 3600:.1f}h",
-                  flush=True)
+            if shard:
+                k, n = shard
+                appids = appids[k::n]
+                tier_label = f"{tier} shard {k}/{n}"
+            else:
+                tier_label = tier
+            print(f"{tier_label}: {len(appids):,} games, "
+                  f"~{len(appids) * SLEEP / 3600:.1f}h", flush=True)
             n = run_single(w, appids, fh)
     print(f"wrote {dst.relative_to(ROOT)} ({n:,} usable)")
 
